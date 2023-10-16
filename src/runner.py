@@ -537,6 +537,24 @@ class Runner:
             # Creating directory and putting the file are idempotent, and can be retried.
             logger.info("Adding proxy setting to the runner.")
 
+            apt_proxy_conf = []
+            if self.config.proxies.get("http"):
+                apt_proxy_conf.append(f'Acquire::http::Proxy "{self.config.proxies["http"]}/";')
+                self.instance.execute(
+                    ["/usr/bin/snap", "set", "system", f'proxy.http={self.config.proxies["http"]}']
+                )
+            if self.config.proxies.get("https"):
+                apt_proxy_conf.append(f'Acquire::https::Proxy "{self.config.proxies["https"]}/";')
+                self.instance.execute(
+                    [
+                        "/usr/bin/snap",
+                        "set",
+                        "system",
+                        f'proxy.https={self.config.proxies["https"]}',
+                    ]
+                )
+            if apt_proxy_conf:
+                self._put_file("/etc/apt/apt.conf.d/10http-proxy.conf", "\n".join(apt_proxy_conf))
             docker_proxy_contents = self._clients.jinja.get_template(
                 "systemd-docker-proxy.j2"
             ).render(proxies=self.config.proxies)
