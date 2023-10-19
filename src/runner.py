@@ -13,6 +13,7 @@ collection of `Runner` instances.
 import json
 import logging
 import pathlib
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -533,59 +534,42 @@ class Runner:
         self._put_file(str(self.env_file), env_contents)
         self.instance.execute(["/usr/bin/chown", "ubuntu:ubuntu", str(self.env_file)])
 
-        if self.config.proxies:
-            # Creating directory and putting the file are idempotent, and can be retried.
-            logger.info("Adding proxy setting to the runner.")
-
-            apt_proxy_conf = []
-            if self.config.proxies.get("http"):
-                apt_proxy_conf.append(f'Acquire::http::Proxy "{self.config.proxies["http"]}/";')
-                self.instance.execute(
-                    ["/usr/bin/snap", "set", "system", f'proxy.http={self.config.proxies["http"]}']
-                )
-            if self.config.proxies.get("https"):
-                apt_proxy_conf.append(f'Acquire::https::Proxy "{self.config.proxies["https"]}/";')
-                self.instance.execute(
-                    [
-                        "/usr/bin/snap",
-                        "set",
-                        "system",
-                        f'proxy.https={self.config.proxies["https"]}',
-                    ]
-                )
-            if apt_proxy_conf:
-                self._put_file("/etc/apt/apt.conf.d/10http-proxy.conf", "\n".join(apt_proxy_conf))
-            docker_proxy_contents = self._clients.jinja.get_template(
-                "systemd-docker-proxy.j2"
-            ).render(proxies=self.config.proxies)
-
-            # Set docker daemon proxy config
-            docker_service_path = Path("/etc/systemd/system/docker.service.d")
-            docker_service_proxy = docker_service_path / "http-proxy.conf"
-
-            self.instance.files.mk_dir(str(docker_service_path))
-            self._put_file(str(docker_service_proxy), docker_proxy_contents)
-
-            self.instance.execute(["systemctl", "daemon-reload"])
-            self.instance.execute(["systemctl", "restart", "docker"])
-
-            # Set docker client proxy config
-            docker_client_proxy = {
-                "proxies": {
-                    "default": {
-                        "httpProxy": self.config.proxies["http"],
-                        "httpsProxy": self.config.proxies["https"],
-                        "noProxy": self.config.proxies["no_proxy"],
-                    }
-                }
-            }
-            docker_client_proxy_content = json.dumps(docker_client_proxy)
-            # Configure the docker client for root user and ubuntu user.
-            self._put_file("/root/.docker/config.json", docker_client_proxy_content)
-            self._put_file("/home/ubuntu/.docker/config.json", docker_client_proxy_content)
+        if self.config.proxies and self.config.proxies.get("https"):
             self.instance.execute(
-                ["/usr/bin/chown", "-R", "ubuntu:ubuntu", "/home/ubuntu/.docker"]
+                ["/usr/bin/snap", "set", "system", f'proxy.http={self.config.proxies["http"]}']
             )
+            self.instance.execute(
+                [
+                    "/usr/bin/snap",
+                    "set",
+                    "system",
+                    f'proxy.https={self.config.proxies["https"]}',
+                ]
+            )
+            self.instance.execute(["/usr/bin/snap", "install", "aproxy", "--edge"])
+            self.instance.execute(["/usr/bin/snap", "set", "aproxy", "proxy=squid.internal:3128"])
+            nftables_script = textwrap.dedent(
+                r"""\
+                nft -f - << EOF
+                define default-ip = $(ip route get $(ip route show 0.0.0.0/0 | grep -oP 'via \K\S+') | grep -oP 'src \K\S+')
+                define private-ips = { 10.0.0.0/8, 127.0.0.1/8, 172.16.0.0/12, 192.168.0.0/16 }
+                table ip aproxy
+                flush table ip aproxy
+                table ip aproxy {
+                      chain prerouting {
+                              type nat hook prerouting priority dstnat; policy accept;
+                              ip daddr != \$private-ips tcp dport { 80, 443 } counter dnat to \$default-ip:8443
+                      }
+                
+                      chain output {
+                              type nat hook output priority -100; policy accept;
+                              ip daddr != \$private-ips tcp dport { 80, 443 } counter dnat to \$default-ip:8443
+                      }
+                }
+                EOF
+                """
+            )
+            self.instance.execute(["/bin/bash", "-c", nftables_script])
 
         # Ensure the no existing /usr/bin/python.
         self.instance.execute(["rm", "/usr/bin/python"])
